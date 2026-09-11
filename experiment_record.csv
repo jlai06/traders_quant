@@ -1,0 +1,2 @@
+experiment_id,hypothesis_version,asset_universe,historical_period,data_and_features,model_or_rule,key_parameters,main_result,retained,reason
+EXP-001,"v1 - raw returns only, no cost/market adjustment","US IPOs 2018-2025, SPACs excluded via SIC 6770","2018-01-01 to 2025-12-31","Massive IPO endpoint + daily aggregates","Mean day1-close to day2-close return, t-test vs. zero","None","TBD - fill in after first run","TBD","TBD"
