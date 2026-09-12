@@ -34,6 +34,7 @@ load_dotenv()  # reads .env in the current directory, if present
 API_KEY = os.environ["MASSIVE_API_KEY"]
 BASE_URL = "https://api.massive.com"
 SESSION = requests.Session()
+SESSION.headers.update({"Authorization": f"Bearer {API_KEY}"})  # key lives in a header, never in a URL
 
 
 def get_historical_ipos(start_date: str, end_date: str, limit: int = 1000) -> pd.DataFrame:
@@ -46,12 +47,11 @@ def get_historical_ipos(start_date: str, end_date: str, limit: int = 1000) -> pd
         "limit": limit,
         "sort": "listing_date",
         "order": "asc",
-        "apiKey": API_KEY,
     }
 
     results = []
     while True:
-        resp = SESSION.get(url, params=params)
+        resp = SESSION.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         results.extend(data.get("results", []))
@@ -59,7 +59,7 @@ def get_historical_ipos(start_date: str, end_date: str, limit: int = 1000) -> pd
         next_url = data.get("next_url")
         if not next_url:
             break
-        url, params = next_url, {"apiKey": API_KEY}  # next_url already carries the cursor
+        url, params = next_url, {}  # next_url already carries its own query params; auth comes from the session header
         time.sleep(0.2)  # be polite to rate limits
 
     return pd.DataFrame(results)
@@ -71,7 +71,7 @@ def get_sic_code(ticker: str) -> str | None:
     Returns None if the lookup fails (e.g. an old delisted ticker with no reference record)."""
     url = f"{BASE_URL}/v3/reference/tickers/{ticker}"
     try:
-        resp = SESSION.get(url, params={"apiKey": API_KEY})
+        resp = SESSION.get(url, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         return data.get("results", {}).get("sic_code")
@@ -93,7 +93,17 @@ def classify_spacs(ipo_df: pd.DataFrame) -> pd.DataFrame:
     and falling back to the price/name heuristic when the SIC lookup is unavailable.
     Also reports how often the two methods agree - worth logging as a validation check."""
     df = ipo_df.copy()
-    df["sic_code"] = df["ticker"].apply(get_sic_code)
+    total = len(df)
+
+    sic_codes = []
+    print(f"Looking up SIC codes for {total} tickers - this makes one API call per ticker...")
+    for i, ticker in enumerate(df["ticker"], start=1):
+        if i % 25 == 0 or i == total:
+            print(f"  ...checked {i}/{total} tickers")
+        sic_codes.append(get_sic_code(ticker))
+        time.sleep(0.1)
+    df["sic_code"] = sic_codes
+
     df["heuristic_spac"] = df.apply(looks_like_spac_heuristic, axis=1)
     df["sic_spac"] = df["sic_code"] == "6770"
 
@@ -105,14 +115,22 @@ def classify_spacs(ipo_df: pd.DataFrame) -> pd.DataFrame:
         agreement = (df.loc[both_known, "sic_spac"] == df.loc[both_known, "heuristic_spac"]).mean()
         print(f"SIC vs. heuristic agreement on {both_known.sum()} tickers with a known SIC code: {agreement:.1%}")
 
+        mismatches = df.loc[
+            both_known & (df["sic_spac"] != df["heuristic_spac"]),
+            ["ticker", "issuer_name", "final_issue_price", "sic_code", "sic_spac", "heuristic_spac"],
+        ]
+        if len(mismatches) > 0:
+            mismatches.to_csv("spac_classification_mismatches.csv", index=False)
+            print(f"Saved {len(mismatches)} disagreements to spac_classification_mismatches.csv for manual review")
+
     return df
 
 
 def get_daily_bars(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     """Pull daily OHLCV bars for a ticker between two dates (inclusive)."""
     url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
-    params = {"adjusted": "true", "sort": "asc", "apiKey": API_KEY}
-    resp = SESSION.get(url, params=params)
+    params = {"adjusted": "true", "sort": "asc"}
+    resp = SESSION.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
