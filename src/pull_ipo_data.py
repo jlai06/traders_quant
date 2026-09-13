@@ -13,17 +13,19 @@ This is a starting scaffold, not the finished pipeline. It handles:
        heuristic as a fallback when a SIC lookup isn't available
     3. Pulling daily OHLCV bars for each ticker's first two trading days
     4. Pulling the benchmark (SPY) over the same range
-    5. Computing raw and market-adjusted close-to-close returns
+    5. Computing raw, market-adjusted, and spread-cost-adjusted close-to-close returns
+       (spread estimated via the Corwin-Schultz high-low method; a flat 0.5% alternative
+       is also computed for a sensitivity check)
 
 Still to do (see README / decision log):
     - Validate the SPAC filter against a manual sample before trusting it
     - Decide how to handle IPOs with a halted or partial first trading day
-    - Add a spread-cost estimate (e.g., Corwin-Schultz high-low estimator)
     - Run the significance test (t-test + a non-parametric check) on the results
 """
 
 import os
 import time
+import math
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -146,6 +148,32 @@ def get_daily_bars(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     return df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
 
 
+def corwin_schultz_spread(day1: pd.Series, day2: pd.Series) -> float:
+    """Estimate the proportional bid-ask spread from two consecutive days' high/low prices,
+    using the Corwin & Schultz (2012) high-low estimator. Returns a proportion (e.g. 0.01 = 1%).
+
+    Reference: Corwin, S. A., & Schultz, P. (2012). A Simple Way to Estimate Bid-Ask
+    Spreads from Daily High and Low Prices. Journal of Finance, 67(2), 719-760.
+
+    Negative estimates (a known artifact of this method in some samples) are floored at 0,
+    per the convention used in the original paper.
+    """
+    h1, l1 = day1["high"], day1["low"]
+    h2, l2 = day2["high"], day2["low"]
+    if any(x is None or x <= 0 for x in (h1, l1, h2, l2)):
+        return float("nan")
+
+    beta = math.log(h1 / l1) ** 2 + math.log(h2 / l2) ** 2
+    h_max, l_min = max(h1, h2), min(l1, l2)
+    gamma = math.log(h_max / l_min) ** 2
+
+    denom = 3 - 2 * math.sqrt(2)
+    alpha = (math.sqrt(2 * beta) - math.sqrt(beta)) / denom - math.sqrt(gamma / denom)
+    spread = 2 * (math.exp(alpha) - 1) / (1 + math.exp(alpha))
+
+    return max(spread, 0.0)
+
+
 def build_sample(ipo_df: pd.DataFrame, benchmark_ticker: str = "SPY") -> pd.DataFrame:
     """For each eligible IPO, pull day-1/day-2 bars and compute raw + market-adjusted returns."""
     rows = []
@@ -178,6 +206,9 @@ def build_sample(ipo_df: pd.DataFrame, benchmark_ticker: str = "SPY") -> pd.Data
             continue  # benchmark didn't trade on one of these dates - shouldn't normally happen
         bench_return = (bench_by_date[day2["date"]] - bench_by_date[day1["date"]]) / bench_by_date[day1["date"]]
 
+        spread_estimate = corwin_schultz_spread(day1, day2)
+        market_adjusted_return = stock_return - bench_return
+
         rows.append({
             "ticker": ticker,
             "listing_date": listing_date,
@@ -187,7 +218,12 @@ def build_sample(ipo_df: pd.DataFrame, benchmark_ticker: str = "SPY") -> pd.Data
             "day2_close": day2["close"],
             "raw_return": stock_return,
             "benchmark_return": bench_return,
-            "market_adjusted_return": stock_return - bench_return,
+            "market_adjusted_return": market_adjusted_return,
+            "cs_spread_estimate": spread_estimate,
+            # Full hypothesis quantity: positive AND significant is the actual test.
+            "net_abnormal_return": market_adjusted_return - spread_estimate,
+            # Fixed 0.5% round-trip cost, for a sensitivity check against the CS estimate.
+            "net_abnormal_return_flat_cost": market_adjusted_return - 0.005,
         })
         time.sleep(0.15)
 
@@ -198,7 +234,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # Adjust this range once you've confirmed how far back your plan's history actually goes
-    ipos = get_historical_ipos(start_date="2018-01-01", end_date="2025-12-31")
+    ipos = get_historical_ipos(start_date="2026-01-01", end_date="2026-09-01")
     print(f"Pulled {len(ipos)} historical IPO events")
 
     if len(ipos) == 0:
@@ -223,4 +259,4 @@ if __name__ == "__main__":
     if len(sample) == 0:
         print("WARNING: sample is empty - check for silent errors above, or narrow the date range and re-run.")
     else:
-        print(sample[["raw_return", "market_adjusted_return"]].describe())
+        print(sample[["raw_return", "market_adjusted_return", "cs_spread_estimate", "net_abnormal_return"]].describe())
