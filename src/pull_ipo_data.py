@@ -82,18 +82,27 @@ def get_sic_code(ticker: str) -> str | None:
 
 
 def looks_like_spac_heuristic(row: pd.Series) -> bool:
-    """Fallback heuristic when a SIC lookup isn't available. Price ~$10 or 'acquisition' in the name."""
+    """Fallback / secondary heuristic. Price ~$10, 'acquisition' in the name, or a ticker
+    ending in 'U' (the standard convention for SPAC Unit offerings - one share plus a
+    warrant fraction, traded bundled before separating). The 'U' suffix turned out to be
+    the most reliable single signal found during validation (see decision log,
+    2026-09-14): SIC code frequently reflects a SPAC's stated TARGET industry rather than
+    a generic blank-check code, causing real SPACs to be missed by SIC alone."""
     price_fields = [row.get("final_issue_price"), row.get("lowest_offer_price"), row.get("highest_offer_price")]
     price_fields = [p for p in price_fields if pd.notna(p)]
     near_ten = any(abs(p - 10.0) < 0.05 for p in price_fields)
     name_hint = "acquisition" in str(row.get("issuer_name", "")).lower()
-    return near_ten or name_hint
+    unit_ticker = str(row.get("ticker", "")).endswith("U")
+    return near_ten or name_hint or unit_ticker
 
 
 def classify_spacs(ipo_df: pd.DataFrame) -> pd.DataFrame:
-    """Classify each IPO as a likely SPAC, preferring the authoritative SIC code (6770)
-    and falling back to the price/name heuristic when the SIC lookup is unavailable.
-    Also reports how often the two methods agree - worth logging as a validation check."""
+    """Classify each IPO as a likely SPAC. SIC 6770 is a reliable positive signal when
+    present, but validation showed it MISSES many real SPACs that have a declared target
+    industry instead of a generic blank-check code - so a SIC code of 6770 OR a positive
+    heuristic result (which now includes the 'U' ticker suffix) is treated as sufficient
+    evidence of a SPAC, rather than letting an available-but-wrong SIC code override a
+    correct heuristic call."""
     df = ipo_df.copy()
     total = len(df)
 
@@ -109,8 +118,9 @@ def classify_spacs(ipo_df: pd.DataFrame) -> pd.DataFrame:
     df["heuristic_spac"] = df.apply(looks_like_spac_heuristic, axis=1)
     df["sic_spac"] = df["sic_code"] == "6770"
 
-    # Prefer the SIC result when we have one; fall back to the heuristic otherwise
-    df["is_likely_spac"] = df["sic_spac"].where(df["sic_code"].notna(), df["heuristic_spac"])
+    # Either signal indicating SPAC is sufficient - SIC 6770 is reliable when it fires,
+    # but is not reliable enough in the negative direction to override a positive heuristic.
+    df["is_likely_spac"] = df["sic_spac"] | df["heuristic_spac"]
 
     both_known = df["sic_code"].notna()
     if both_known.any():
@@ -212,6 +222,7 @@ def build_sample(ipo_df: pd.DataFrame, benchmark_ticker: str = "SPY") -> pd.Data
         rows.append({
             "ticker": ticker,
             "listing_date": listing_date,
+            "primary_exchange": ipo.get("primary_exchange"),
             "day1_date": day1["date"],
             "day2_date": day2["date"],
             "day1_close": day1["close"],
@@ -234,7 +245,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # Adjust this range once you've confirmed how far back your plan's history actually goes
-    ipos = get_historical_ipos(start_date="2026-01-01", end_date="2026-09-01")
+    ipos = get_historical_ipos(start_date="2018-01-01", end_date="2025-12-31")
     print(f"Pulled {len(ipos)} historical IPO events")
 
     if len(ipos) == 0:
@@ -251,12 +262,30 @@ if __name__ == "__main__":
     sample = build_sample(eligible)
 
     output_path = os.path.abspath("ipo_day1_day2_returns.csv")
-    sample.to_csv(output_path, index=False)
+
+    # Price-plausibility filter: genuine underwritten IPOs on major exchanges essentially
+    # never price below ~$3 or above ~$500. Values outside this band are almost always an
+    # artifact of Massive's split-adjustment being applied through a LATER reverse split
+    # that happened after the historical IPO date, not a real IPO price. See decision log
+    # entry 2026-09-14 for how this was discovered.
+    MIN_PLAUSIBLE_PRICE = 3.0
+    MAX_PLAUSIBLE_PRICE = 500.0
+    implausible = sample[(sample["day1_close"] < MIN_PLAUSIBLE_PRICE) | (sample["day1_close"] > MAX_PLAUSIBLE_PRICE)]
+    sample_filtered = sample[(sample["day1_close"] >= MIN_PLAUSIBLE_PRICE) & (sample["day1_close"] <= MAX_PLAUSIBLE_PRICE)]
+
+    if len(implausible) > 0:
+        excluded_path = output_path.replace(".csv", "_excluded_implausible_price.csv")
+        implausible.to_csv(excluded_path, index=False)
+        print(f"Excluded {len(implausible)}/{len(sample)} rows outside "
+              f"${MIN_PLAUSIBLE_PRICE}-${MAX_PLAUSIBLE_PRICE} day-1 price band "
+              f"({len(implausible)/len(sample):.1%}) - saved to {excluded_path} for review")
+
+    sample_filtered.to_csv(output_path, index=False)
     elapsed = time.time() - start_time
 
     print(f"\nDone in {elapsed:.0f}s.")
-    print(f"Saved {len(sample)} eligible IPO observations to:\n  {output_path}")
-    if len(sample) == 0:
+    print(f"Saved {len(sample_filtered)} eligible IPO observations to:\n  {output_path}")
+    if len(sample_filtered) == 0:
         print("WARNING: sample is empty - check for silent errors above, or narrow the date range and re-run.")
     else:
-        print(sample[["raw_return", "market_adjusted_return", "cs_spread_estimate", "net_abnormal_return"]].describe())
+        print(sample_filtered[["raw_return", "market_adjusted_return", "cs_spread_estimate", "net_abnormal_return"]].describe())
